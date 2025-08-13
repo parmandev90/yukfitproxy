@@ -8,33 +8,38 @@ const app = express();
 
 // ===== ENV =====
 const PORT = process.env.PORT || 8080;
-const PYTHON_API =
-  process.env.PYTHON_API || 'https://pythonapiyukfit.up.railway.app';
-
-// Boleh koma-separated: "https://yukfit.netlify.app,https://localhost:8080"
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://yukfit.netlify.app')
+const PYTHON_API = (process.env.PYTHON_API || 'https://pythonapiyukfit.up.railway.app').replace(/\/+$/, '');
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS
+  || 'https://yukfit.netlify.app,http://localhost:8080,http://localhost:5173')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// ===== fetch (fallback untuk Node < 18) =====
+// ===== fetch (Node < 18 fallback) =====
 const fetchFn = global.fetch
-  ? (...args) => global.fetch(...args)
+  ? global.fetch.bind(global)
   : (...args) => import('node-fetch').then(m => m.default(...args));
 
-// ===== Middlewares =====
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // izinkan tanpa Origin (mis. curl/health check)
-      if (!origin) return cb(null, true);
-      const ok = ALLOWED_ORIGINS.some(o => origin.startsWith(o));
-      return cb(null, ok);
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
-  })
-);
+// ===== CORS (preflight-safe) =====
+const corsOptions = {
+  origin(origin, cb) {
+    // izinkan request tanpa Origin (curl/health check)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // jika tidak diizinkan, jangan set header CORS
+    return cb(null, false);
+  },
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+  optionsSuccessStatus: 204,
+  preflightContinue: false,
+  credentials: false,
+  maxAge: 86400, // cache preflight 1 hari
+};
+
+app.use(cors(corsOptions));
+// penting: balas semua preflight OPTIONS
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -44,12 +49,12 @@ const workoutStorage = {
   items: [],
   add(data) {
     const id = Date.now().toString();
-    const saved = { id, timestamp: new Date(), ...data };
+    const saved = { id, timestamp: new Date().toISOString(), ...data };
     this.items.push(saved);
     return saved;
   },
-  exists(w, criteria = ['age', 'gender', 'height', 'weight', 'bmi']) {
-    return this.items.some(it => criteria.every(k => it[k] === w[k]));
+  exists(w, keys = ['age', 'gender', 'height', 'weight', 'bmi']) {
+    return this.items.some(it => keys.every(k => it[k] === w[k]));
   },
   findById(id) {
     return this.items.find(it => it.id === id);
@@ -62,17 +67,28 @@ const workoutStorage = {
 // ====== PROXY -> Python API ======
 app.post('/api/recommend', async (req, res) => {
   try {
-    const r = await fetchFn(`${PYTHON_API}/api/recommend`, {
+    const upstream = await fetchFn(`${PYTHON_API}/api/recommend`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(req.body),
     });
-    if (!r.ok) throw new Error(`Python API ${r.status}`);
-    const data = await r.json();
-    res.json(data);
+
+    const text = await upstream.text();
+    if (!upstream.ok) {
+      // teruskan status upstream agar mudah debug
+      return res
+        .status(upstream.status)
+        .type('application/json')
+        .send(text || JSON.stringify({ success: false, error: `Upstream error ${upstream.status}` }));
+    }
+
+    // pastikan kirim JSON
+    let data;
+    try { data = JSON.parse(text); } catch { data = text; }
+    return res.json(data);
   } catch (err) {
     console.error('Proxy error /api/recommend:', err);
-    res.status(500).json({ success: false, error: 'Gagal menghubungi API Python' });
+    return res.status(502).json({ success: false, error: 'Gagal menghubungi API Python' });
   }
 });
 
@@ -95,10 +111,10 @@ app.post('/api/save', (req, res) => {
       });
     }
     const saved = workoutStorage.add(d);
-    res.status(201).json({ success: true, message: 'Tersimpan', data: { id: saved.id } });
+    return res.status(201).json({ success: true, message: 'Tersimpan', data: { id: saved.id } });
   } catch (e) {
     console.error('Error /api/save:', e);
-    res.status(500).json({ success: false, error: 'Gagal menyimpan data latihan' });
+    return res.status(500).json({ success: false, error: 'Gagal menyimpan data latihan' });
   }
 });
 
@@ -109,7 +125,7 @@ app.get('/api/saved-workouts', (_req, res) =>
 app.get('/api/saved-workouts/:id', (req, res) => {
   const it = workoutStorage.findById(req.params.id);
   if (!it) return res.status(404).json({ success: false, error: 'Data latihan tidak ditemukan' });
-  res.json({ success: true, data: it });
+  return res.json({ success: true, data: it });
 });
 
 // ====== Health ======
@@ -118,14 +134,14 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     proxy: 'up',
     python_api: PYTHON_API,
+    allowed_origins: ALLOWED_ORIGINS,
     time: new Date().toISOString(),
   });
 });
 
-// (Tidak ada static file/SPA fallback di proxy ini; frontend dilayani Netlify)
-
+// Frontend dilayani Netlify; tidak ada static/SPA fallback di sini.
 app.listen(PORT, () => {
   console.log(`Proxy listening on :${PORT}`);
-  console.log(`PYTHON_API = ${PYTHON_API}`);
+  console.log(`PYTHON_API      = ${PYTHON_API}`);
   console.log(`ALLOWED_ORIGINS = ${ALLOWED_ORIGINS.join(', ')}`);
 });
