@@ -8,14 +8,21 @@ const app = express();
 
 // ===== ENV =====
 const PORT = process.env.PORT || 8080;
-const PYTHON_API = (process.env.PYTHON_API || 'https://pythonapiyukfit.up.railway.app').replace(/\/+$/, '');
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS
-  || 'https://yukfit.netlify.app,http://localhost:8080,http://localhost:5173')
+const PYTHON_API = (process.env.PYTHON_API || 'https://pythonapiyukfit.up.railway.app')
+  .replace(/\/+$/, ''); // hapus trailing slash
+
+// Normalisasi origin: trim, buang trailing slash, lowercase
+const normalizeOrigin = (s) => (s || '').trim().replace(/\/+$/, '').toLowerCase();
+
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS ||
+  'https://yukfit.netlify.app,http://localhost:8080,http://localhost:5173'
+)
   .split(',')
-  .map(s => s.trim())
+  .map(normalizeOrigin)
   .filter(Boolean);
 
-// ===== fetch (Node < 18 fallback) =====
+// ===== fetch fallback (Node < 18) =====
 const fetchFn = global.fetch
   ? global.fetch.bind(global)
   : (...args) => import('node-fetch').then(m => m.default(...args));
@@ -23,14 +30,14 @@ const fetchFn = global.fetch
 // ===== CORS (preflight-safe) =====
 const corsOptions = {
   origin(origin, cb) {
-    // izinkan request tanpa Origin (curl/health check)
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    // jika tidak diizinkan, jangan set header CORS
+    if (!origin) return cb(null, true); // izinkan curl/health-check
+    const o = normalizeOrigin(origin);
+    if (ALLOWED_ORIGINS.includes(o)) return cb(null, true);
+    // tolak dengan tenang: tidak set header CORS
     return cb(null, false);
   },
-  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+  methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Origin','X-Requested-With','Content-Type','Accept','Authorization'],
   optionsSuccessStatus: 204,
   preflightContinue: false,
   credentials: false,
@@ -38,7 +45,8 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-// penting: balas semua preflight OPTIONS
+// balas semua preflight; jika origin tidak diizinkan tetap 204 tapi TANPA header CORS
+// browser tetap blokir — ini normal — tapi tidak akan 404 lagi
 app.options('*', cors(corsOptions));
 
 app.use(express.json());
@@ -53,15 +61,11 @@ const workoutStorage = {
     this.items.push(saved);
     return saved;
   },
-  exists(w, keys = ['age', 'gender', 'height', 'weight', 'bmi']) {
+  exists(w, keys = ['age','gender','height','weight','bmi']) {
     return this.items.some(it => keys.every(k => it[k] === w[k]));
   },
-  findById(id) {
-    return this.items.find(it => it.id === id);
-  },
-  getAll() {
-    return this.items;
-  },
+  findById(id) { return this.items.find(it => it.id === id); },
+  getAll() { return this.items; },
 };
 
 // ====== PROXY -> Python API ======
@@ -73,18 +77,15 @@ app.post('/api/recommend', async (req, res) => {
       body: JSON.stringify(req.body),
     });
 
-    const text = await upstream.text();
+    const bodyText = await upstream.text();
     if (!upstream.ok) {
-      // teruskan status upstream agar mudah debug
       return res
         .status(upstream.status)
         .type('application/json')
-        .send(text || JSON.stringify({ success: false, error: `Upstream error ${upstream.status}` }));
+        .send(bodyText || JSON.stringify({ success: false, error: `Upstream ${upstream.status}` }));
     }
 
-    // pastikan kirim JSON
-    let data;
-    try { data = JSON.parse(text); } catch { data = text; }
+    let data; try { data = JSON.parse(bodyText); } catch { data = bodyText; }
     return res.json(data);
   } catch (err) {
     console.error('Proxy error /api/recommend:', err);
@@ -96,36 +97,30 @@ app.post('/api/recommend', async (req, res) => {
 app.post('/api/save', (req, res) => {
   try {
     const d = req.body;
-    const required = ['age', 'gender', 'height', 'weight', 'bmi'];
-    const miss = required.filter(f => d[f] === undefined || d[f] === null || d[f] === '');
+    const reqd = ['age','gender','height','weight','bmi'];
+    const miss = reqd.filter(f => d[f] === undefined || d[f] === null || d[f] === '');
     if (miss.length) {
-      return res.status(400).json({
-        success: false,
-        error: `Data tidak lengkap. Field diperlukan: ${miss.join(', ')}`,
-      });
+      return res.status(400).json({ success:false, error:`Data tidak lengkap: ${miss.join(', ')}` });
     }
     if (workoutStorage.exists(d)) {
-      return res.status(409).json({
-        success: false,
-        error: 'Data latihan dengan karakteristik yang sama sudah tersimpan',
-      });
+      return res.status(409).json({ success:false, error:'Data latihan yang sama sudah ada' });
     }
     const saved = workoutStorage.add(d);
-    return res.status(201).json({ success: true, message: 'Tersimpan', data: { id: saved.id } });
+    return res.status(201).json({ success:true, message:'Tersimpan', data:{ id: saved.id } });
   } catch (e) {
     console.error('Error /api/save:', e);
-    return res.status(500).json({ success: false, error: 'Gagal menyimpan data latihan' });
+    return res.status(500).json({ success:false, error:'Gagal menyimpan data latihan' });
   }
 });
 
 app.get('/api/saved-workouts', (_req, res) =>
-  res.json({ success: true, data: workoutStorage.getAll() })
+  res.json({ success:true, data: workoutStorage.getAll() })
 );
 
 app.get('/api/saved-workouts/:id', (req, res) => {
   const it = workoutStorage.findById(req.params.id);
-  if (!it) return res.status(404).json({ success: false, error: 'Data latihan tidak ditemukan' });
-  return res.json({ success: true, data: it });
+  if (!it) return res.status(404).json({ success:false, error:'Data latihan tidak ditemukan' });
+  return res.json({ success:true, data: it });
 });
 
 // ====== Health ======
@@ -139,7 +134,7 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-// Frontend dilayani Netlify; tidak ada static/SPA fallback di sini.
+// Frontend dilayani Netlify
 app.listen(PORT, () => {
   console.log(`Proxy listening on :${PORT}`);
   console.log(`PYTHON_API      = ${PYTHON_API}`);
